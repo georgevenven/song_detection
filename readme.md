@@ -1,0 +1,2 @@
+- Both the labeled and yet to be labeled data is stored in /data
+- They are all stored as npz files
