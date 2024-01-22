@@ -3,7 +3,7 @@ from tkinter import filedialog
 from PIL import Image, ImageTk, ImageDraw
 import numpy as np
 import os
-import time
+import matplotlib.cm as cm
 
 def array_to_image(array):
     if array.dtype != np.uint8:
@@ -63,9 +63,7 @@ class SpectrogramViewer:
 
         # Bind mouse wheel event for zooming
         self.canvas.bind("<MouseWheel>", self.toggle_zoom)  # For Windows and MacOS
-        self.canvas.bind("<Button-4>", self.toggle_zoom)  # For Linux, scroll up
-        self.canvas.bind("<Button-5>", self.toggle_zoom)  # For Linux, scroll down
-
+        self.canvas.bind("<Button-3>", self.toggle_zoom)  # For Linux, scroll up
 
         # Bind navigation keys directly to the canvas
         self.canvas.bind("<e>", self.scroll_right)
@@ -167,13 +165,25 @@ class SpectrogramViewer:
         self.apply_selection_mask()  # Apply the current selection mask with new zoom factor
 
     def toggle_zoom(self, event):
+        # Calculate the clicked position relative to the current zoom level
+        clicked_x = self.canvas.canvasx(event.x) * (1 / self.zoom_factor)
+
         self.is_zoomed_out = not self.is_zoomed_out
         if self.is_zoomed_out:
             self.zoom_factor = self.zoomed_out_factor
         else:
             self.zoom_factor = self.normal_zoom_factor
+
+        # Apply zoom
         self.zoom_spectrogram(self.zoom_factor)
 
+        # Calculate new position after zoom
+        new_x = clicked_x * self.zoom_factor
+
+        # Adjust canvas view to center on the clicked position
+        canvas_width = self.canvas.winfo_width()
+        new_scroll_x = max(0, min(new_x - canvas_width / 2, self.original_image.width * self.zoom_factor - canvas_width))
+        self.canvas.xview_moveto(new_scroll_x / (self.original_image.width * self.zoom_factor))
 
     def zoom_spectrogram(self, zoom_factor):
         new_width = int(self.original_image.width * zoom_factor)
@@ -211,7 +221,7 @@ class SpectrogramViewer:
         self.filename_label.config(text=filename)
         file_number_text = f"File {self.current_file_index + 1} of {len(self.file_list)}"
         self.file_number_label.config(text=file_number_text)
-        
+
         npz_data = np.load(file_path, allow_pickle=True)
         spectrogram = npz_data['s']
         spectrogram = (spectrogram - spectrogram.min()) / (spectrogram.max() - spectrogram.min())
@@ -219,7 +229,11 @@ class SpectrogramViewer:
         # Flip the spectrogram vertically
         spectrogram = np.flipud(spectrogram)
 
-        self.original_image = array_to_image(spectrogram * 255)
+        # Apply a colormap to the normalized spectrogram
+        colored_spectrogram = cm.viridis(spectrogram)
+
+        # Convert the colored spectrogram to an RGB image
+        self.original_image = Image.fromarray((colored_spectrogram[:, :, :3] * 255).astype(np.uint8))
 
         self.song_labels = npz_data.get('song', np.zeros(spectrogram.shape[-1], dtype=np.uint8))
         self.selection_mask = Image.new('1', self.original_image.size, 0)
@@ -238,7 +252,6 @@ class SpectrogramViewer:
         self.draw_timeline()
 
         self.apply_selection_mask()
-
 
     def update_spectrogram_display(self, image):
         self.canvas.config(scrollregion=(0, 0, image.width, image.height))
