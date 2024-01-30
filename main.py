@@ -185,17 +185,20 @@ class SpectrogramViewer:
 
     def apply_selection_mask(self):
         # Apply the selection mask to the zoomed image
-        zoomed_width = int(self.original_image.width * self.zoom_factor)
-        zoomed_image = self.original_image.resize((zoomed_width, self.original_image.height), Image.Resampling.LANCZOS)
+        try:
+            zoomed_width = int(self.original_image.width * self.zoom_factor)
+            zoomed_image = self.original_image.resize((zoomed_width, self.original_image.height), Image.Resampling.LANCZOS)
+            if self.selection_mask is not None:
+                # Resize the mask to the zoomed dimensions
+                zoomed_mask = self.selection_mask.resize((zoomed_width, self.original_image.height), Image.Resampling.NEAREST)
+                marked_image = blend_with_red(zoomed_image, zoomed_mask)
+            else:
+                marked_image = zoomed_image
 
-        if self.selection_mask is not None:
-            # Resize the mask to the zoomed dimensions
-            zoomed_mask = self.selection_mask.resize((zoomed_width, self.original_image.height), Image.Resampling.NEAREST)
-            marked_image = blend_with_red(zoomed_image, zoomed_mask)
-        else:
-            marked_image = zoomed_image
+            self.update_spectrogram_display(marked_image)
 
-        self.update_spectrogram_display(marked_image)
+        except:
+            print("ignore this too")
 
     def on_mousewheel(self, event):
         # Calculate the clicked position relative to the current zoom level
@@ -326,7 +329,10 @@ class SpectrogramViewer:
         self.initial_zoom_factor = initial_window_width / self.original_image.width
         self.zoom_factor = self.initial_zoom_factor
 
-        self.apply_selection_mask()
+        try:
+            self.apply_selection_mask()
+        except:
+            print("ignore this")
 
     def get_keyboard_bindings_text(self):
         bindings_text = (
