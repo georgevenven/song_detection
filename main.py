@@ -6,10 +6,14 @@ import os
 import matplotlib.cm as cm
 import json
 import threading
-import queue
-import random
+import time
 import tkinter.messagebox as messagebox
-import traceback
+import logging
+import fcntl  # For file locking
+import io  # For BytesIO
+import traceback  # Add this import at the top of your file
+
+logging.basicConfig(level=logging.DEBUG)
 
 def array_to_image(array):
     if array.dtype != np.uint8:
@@ -30,18 +34,21 @@ class SpectrogramViewer:
         self.source_folder = source_folder
         self.output_folder = output_folder
         self.file_list = sorted([f for f in os.listdir(self.source_folder) if f.endswith('.npz')])
+        
+        if not self.file_list:
+            messagebox.showerror("Error", "No .npz files found in the selected source folder.")
+            self.root.destroy()
+            return
+
         self.json_path = os.path.join(source_folder, 'labeled_files.json')
         self.labeled_files = self.load_labeled_files()
-        self.labeled_files_order = []
-        self.current_file_index = -1
+        self.labeled_files_order = list(self.labeled_files)
+        self.current_file_index = 0  # Start with the first file
 
         # UI setup
         self.setup_ui()
 
-        self.downsample_factor = 8  # Adjust this value to change the downsampling level
-        self.preload_queue = queue.Queue(maxsize=5)
-        self.preload_thread = threading.Thread(target=self.preload_spectrograms, daemon=True)
-        self.preload_thread.start()
+        self.downsample_factor = 1  # Adjust this value to change the downsampling level
 
         self.current_label = 1  # 1 for red, 2 for green
         self.label_colors = {1: "Red", 2: "Green"}
@@ -64,8 +71,18 @@ class SpectrogramViewer:
         self.mode_label = tk.Label(self.root, text="Normal Mode", fg="white", bg="black", font=("Courier", 16, "bold"), anchor="w")
         self.mode_label.pack(side="top", fill="x")
 
-        self.load_next_file()
+        self.current_npz_data = None
+        self.current_filename = None
+
+        self.load_spectrogram()
+        self.update_file_info()  # Add this line
         self.update_label_info()  # Initialize label info display
+
+        # Start auto-save thread
+        self.auto_save_interval = 60  # Auto-save every 60 seconds
+        self.auto_save_thread = threading.Thread(target=self.auto_save_worker, daemon=True)
+        self.auto_save_event = threading.Event()
+        self.auto_save_thread.start()
 
     def setup_ui(self):
         # Increase font size and make bold
@@ -109,6 +126,10 @@ class SpectrogramViewer:
         self.canvas.bind("<n>", self.next_unseen_file)
         self.canvas.bind("w", self.clear_annotations)
         self.canvas.bind("r", self.toggle_review_mode)
+
+        # Add an exit button
+        exit_button = tk.Button(self.root, text="X", command=self.exit_app, bg="red", fg="white")
+        exit_button.pack(side="top", anchor="ne")
 
     def on_press(self, event):
         self.selection_start = self.canvas.canvasx(event.x)
@@ -165,13 +186,14 @@ class SpectrogramViewer:
             self.song_labels[start:end+1] = self.current_label
 
             self.apply_selection_mask()
-            print(f"Marked selection from {start} to {end} with label {self.current_label}")
+            self.save_current_markings()  # Save immediately after marking
+            logging.debug(f"Marked selection from {start} to {end} with label {self.current_label}")
 
         self.canvas.focus_set()
 
     def apply_selection_mask(self):
         if self.original_image.width == 0 or self.original_image.height == 0:
-            print("Cannot apply selection mask: Invalid original image dimensions")
+            logging.error("Cannot apply selection mask: Invalid original image dimensions")
             return
 
         zoomed_width = max(1, int(self.original_image.width * self.zoom_factor))
@@ -189,27 +211,34 @@ class SpectrogramViewer:
 
     def load_spectrogram(self):
         if self.current_file_index < 0 or self.current_file_index >= len(self.file_list):
-            print(f"Invalid current_file_index: {self.current_file_index}")
+            logging.error(f"Invalid current_file_index: {self.current_file_index}")
             return
 
         filename = self.file_list[self.current_file_index]
-        self.filename_label.config(text=filename)
-        self.file_number_label.config(text=f"File {self.current_file_index + 1} of {len(self.file_list)}")
-
-        # Load and process spectrogram
+        self.current_filename = filename
+        
         file_path = os.path.join(self.source_folder, filename)
         try:
-            npz_data = np.load(file_path, allow_pickle=True)
-            spectrogram = self.downsample_spectrogram(npz_data['s'])
+            # Read the file into memory with file locking
+            with open(file_path, 'rb') as f:
+                fcntl.flock(f, fcntl.LOCK_SH)
+                data = f.read()
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+            # Load the data from the in-memory bytes
+            self.current_npz_data = np.load(io.BytesIO(data), allow_pickle=True)
+
+            spectrogram = self.downsample_spectrogram(self.current_npz_data['s'])
             
-            print(f"Spectrogram shape: {spectrogram.shape}")
+            logging.debug(f"Spectrogram shape: {spectrogram.shape}")
             
             if spectrogram.size == 0:
-                print(f"Empty spectrogram in file: {filename}")
+                logging.error(f"Empty spectrogram in file: {filename}")
                 return
 
-            self.song_labels = npz_data.get('song', np.zeros(spectrogram.shape[-1], dtype=np.uint8))
-            self.song_labels = self.song_labels[::self.downsample_factor]
+            full_song_labels = self.current_npz_data.get('song', np.zeros(self.current_npz_data['s'].shape[1], dtype=np.uint8))
+            # Downsample the labels
+            self.song_labels = full_song_labels[::self.downsample_factor]
 
             # Normalize and process spectrogram
             spectrogram = (spectrogram - spectrogram.min()) / (spectrogram.max() - spectrogram.min())
@@ -217,10 +246,10 @@ class SpectrogramViewer:
             colored_spectrogram = cm.viridis(spectrogram)
             self.original_image = Image.fromarray((colored_spectrogram[:, :, :3] * 255).astype(np.uint8))
 
-            print(f"Original image size: {self.original_image.size}")
+            logging.debug(f"Original image size: {self.original_image.size}")
 
             if self.original_image.width == 0 or self.original_image.height == 0:
-                print(f"Invalid image dimensions in file: {filename}")
+                logging.error(f"Invalid image dimensions in file: {filename}")
                 return
 
             self.selection_mask = Image.new('L', self.original_image.size, 0)
@@ -247,8 +276,14 @@ class SpectrogramViewer:
                 self.update_review_hud()
 
         except Exception as e:
-            print(f"Error loading file {filename}: {str(e)}")
+            logging.error(f"Error loading file {filename}: {str(e)}")
+            messagebox.showerror("Error", f"Failed to load file {filename}: {str(e)}")
             traceback.print_exc()
+            # Initialize with empty data if loading fails
+            self.current_npz_data = None
+            self.song_labels = np.array([])
+
+        self.update_file_info()
 
     def update_spectrogram_display(self, image):
         self.canvas.delete("all")
@@ -258,60 +293,100 @@ class SpectrogramViewer:
         self.canvas.image = tk_image
 
     def clear_annotations(self, event):
-        self.selection_mask = Image.new('L', self.original_image.size, 0)
-        self.song_labels = np.zeros(self.original_image.width, dtype=np.uint8)
-        self.apply_selection_mask()
-        self.save_current_markings()
-        print("Annotations cleared")
+        confirm = messagebox.askyesno("Confirm", "Are you sure you want to clear all annotations?")
+        if confirm:
+            self.selection_mask = Image.new('L', self.original_image.size, 0)
+            self.song_labels = np.zeros(self.original_image.width, dtype=np.uint8)
+            self.apply_selection_mask()
+            self.save_current_markings()
+            logging.debug("Annotations cleared")
         self.canvas.focus_set()
 
     def save_current_markings(self):
-        file_path = os.path.join(self.source_folder, self.file_list[self.current_file_index])
-        npz_data = np.load(file_path, allow_pickle=True)
-        npz_data_dict = dict(npz_data)
+        if self.current_npz_data is None or self.current_filename is None:
+            logging.debug("No data to save")
+            return
 
-        # Get the original number of timebins
-        original_timebins = npz_data['s'].shape[1]
-
-        # Create an array of the original size
+        # Upsample the labels to full resolution
+        original_timebins = self.current_npz_data['s'].shape[1]
         full_song_labels = np.zeros(original_timebins, dtype=np.uint8)
-
-        # Map the downsampled labels back to the original scale
+        factor = self.downsample_factor
         for i, label in enumerate(self.song_labels):
-            start = i * self.downsample_factor
-            end = min((i + 1) * self.downsample_factor, original_timebins)
+            start = i * factor
+            end = min((i + 1) * factor, original_timebins)
             full_song_labels[start:end] = label
 
-        npz_data_dict['song'] = full_song_labels
+        try:
+            # Create a backup before overwriting
+            filename = self.current_filename
+            file_path = os.path.join(self.source_folder, filename)
+            backup_path = file_path + '.bak'
+            if os.path.exists(file_path):
+                if not os.path.exists(backup_path):
+                    os.rename(file_path, backup_path)
+                else:
+                    os.remove(file_path)
+            else:
+                logging.warning(f"Original file {file_path} does not exist for backup.")
 
-        np.savez(file_path, **npz_data_dict)
-
-        self.total_song_timebins += np.sum(full_song_labels > 0)
-        self.total_non_song_timebins += len(full_song_labels) - np.sum(full_song_labels > 0)
-
-        print(f"Saved markings for file: {self.file_list[self.current_file_index]}")
+            # Acquire an exclusive lock for writing
+            with open(file_path, 'wb') as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                updated_data = {}
+                for key in self.current_npz_data.files:
+                    if key != 'song':
+                        try:
+                            updated_data[key] = self.current_npz_data[key]
+                        except Exception as e:
+                            logging.error(f"Skipping corrupted array: {key}")
+                    else:
+                        updated_data['song'] = full_song_labels
+                np.savez(f, **updated_data)
+                fcntl.flock(f, fcntl.LOCK_UN)
+            logging.debug(f"Saved markings for file: {filename}")
+            self.mark_file_as_labeled()
+        except Exception as e:
+            logging.error(f"Error saving markings for file {filename}: {str(e)}")
+            messagebox.showerror("Save Error", f"Failed to save labels for {filename}: {str(e)}")
+            traceback.print_exc()
 
     def prev_file(self, event):
         if self.review_mode:
-            self.save_current_markings()  # Save changes before moving to previous file
-            self.review_index = (self.review_index - 1) % len(self.labeled_files_list)
-            self.load_review_file()
+            self.prev_review_file()
         else:
             self.save_current_markings()
-            self.mark_file_as_labeled()
-            self.load_previous_file()
+            self.current_file_index = max(0, self.current_file_index - 1)
+            self.load_spectrogram()
+        self.update_file_info()
         self.canvas.focus_set()
 
     def next_file(self, event):
         if self.review_mode:
-            self.save_current_markings()  # Save changes before moving to next file
-            self.review_index = (self.review_index + 1) % len(self.labeled_files_list)
-            self.load_review_file()
+            self.next_review_file()
         else:
             self.save_current_markings()
-            self.mark_file_as_labeled()
-            self.load_next_file()
+            self.current_file_index = min(len(self.file_list) - 1, self.current_file_index + 1)
+            self.load_spectrogram()
+        self.update_file_info()
         self.canvas.focus_set()
+
+    def prev_review_file(self):
+        self.save_current_markings()
+        self.review_index = max(0, self.review_index - 1)
+        self.load_review_file()
+
+    def next_review_file(self):
+        self.save_current_markings()
+        self.review_index = min(len(self.labeled_files_list) - 1, self.review_index + 1)
+        self.load_review_file()
+
+    def update_file_info(self):
+        if self.review_mode:
+            self.update_review_hud()
+        else:
+            filename = self.file_list[self.current_file_index]
+            self.filename_label.config(text=filename)
+            self.file_number_label.config(text=f"File {self.current_file_index + 1} of {len(self.file_list)}")
 
     def jump_forward(self, event):
         self.save_current_markings()
@@ -333,7 +408,12 @@ class SpectrogramViewer:
             return  # No summary file, can't determine unseen files
 
         with open(json_path, 'r') as file:
-            summary_data = json.load(file)
+            try:
+                summary_data = json.load(file)
+            except json.JSONDecodeError:
+                logging.error("Corrupted summary.json file.")
+                messagebox.showerror("Error", "Corrupted summary.json file.")
+                return
 
         processed_files = set(summary_data.get('processed_files', []))
         for index, filename in enumerate(self.file_list):
@@ -358,76 +438,55 @@ class SpectrogramViewer:
 
     def downsample_spectrogram(self, spectrogram):
         # Downsample the spectrogram
-        return spectrogram[:, ::self.downsample_factor]
-
-    def preload_spectrograms(self):
-        while True:
-            current_index = self.current_file_index
-            for i in range(current_index, min(current_index + 5, len(self.file_list))):
-                if i not in self.preload_queue.queue:
-                    file_path = os.path.join(self.source_folder, self.file_list[i])
-                    try:
-                        npz_data = np.load(file_path, allow_pickle=True)
-                        spectrogram = self.downsample_spectrogram(npz_data['s'])
-                        song_labels = npz_data.get('song', np.zeros(spectrogram.shape[-1], dtype=np.uint8))
-                        song_labels = song_labels[::self.downsample_factor]  # Downsample labels
-                        self.preload_queue.put((i, spectrogram, song_labels))
-                    except Exception as e:
-                        print(f"Error preloading file {file_path}: {e}")
+        factor = self.downsample_factor
+        if factor == 1:
+            return spectrogram
+        else:
+            # Handle cases where the spectrogram's timebins are not divisible by factor
+            timebins = spectrogram.shape[1]
+            new_timebins = timebins // factor
+            spectrogram = spectrogram[:, :new_timebins * factor]
+            spectrogram = spectrogram.reshape(spectrogram.shape[0], new_timebins, factor).mean(axis=2)
+            return spectrogram
 
     def exit_app(self):
-        self.save_current_markings()
-        self.mark_file_as_labeled()
-        self.root.destroy()
+        if messagebox.askokcancel("Quit", "Do you want to quit?"):
+            self.save_current_markings()  # Save any unsaved changes
+            self.root.quit()
+            self.root.destroy()
 
     def load_labeled_files(self):
         if os.path.exists(self.json_path):
-            with open(self.json_path, 'r') as f:
-                labeled_files = json.load(f)
-                self.labeled_files_order = labeled_files.copy()
-                return set(labeled_files)
+            try:
+                with open(self.json_path, 'r') as f:
+                    data = json.load(f)
+                    return set(data)
+            except json.JSONDecodeError:
+                logging.error("Corrupted labeled_files.json file.")
+                messagebox.showerror("Error", "Corrupted labeled_files.json file.")
+                return set()
         return set()
 
     def save_labeled_files(self):
-        with open(self.json_path, 'w') as f:
-            json.dump(list(self.labeled_files), f)
-
-    def get_random_unlabeled_file(self):
-        unlabeled_files = set(self.file_list) - self.labeled_files
-        if unlabeled_files:
-            return random.choice(list(unlabeled_files))
-        return None
-
-    def load_next_file(self):
-        next_file = self.get_random_unlabeled_file()
-        if next_file:
-            self.current_file_index = self.file_list.index(next_file)
-        else:
-            self.current_file_index = min(len(self.file_list) - 1, self.current_file_index + 1)
-        self.load_spectrogram()
-
-    def load_previous_file(self):
-        if self.labeled_files_order:
-            prev_file = self.labeled_files_order.pop()
-            self.current_file_index = self.file_list.index(prev_file)
-        else:
-            self.current_file_index = max(0, self.current_file_index - 1)
-        self.load_spectrogram()
+        try:
+            with open(self.json_path, 'w') as f:
+                json.dump(list(self.labeled_files), f)
+            logging.debug(f"Saved labeled files: {self.labeled_files}")
+        except Exception as e:
+            logging.error(f"Error saving labeled files: {e}")
+            messagebox.showerror("Error", f"Failed to save labeled files: {str(e)}")
 
     def mark_file_as_labeled(self):
-        current_file = self.file_list[self.current_file_index]
-        if current_file not in self.labeled_files:
-            self.labeled_files.add(current_file)
-            self.labeled_files_order.append(current_file)
-            self.save_labeled_files()
-        if self.review_mode and current_file not in self.labeled_files_list:
-            self.labeled_files_list.append(current_file)
+        current_file = os.path.basename(self.file_list[self.current_file_index])
+        self.labeled_files.add(current_file)
+        logging.debug(f"Marking {current_file} as labeled")
+        self.save_labeled_files()
 
     def toggle_review_mode(self, event):
-        if self.review_mode:
-            self.save_current_markings()  # Save changes when exiting review mode
+        self.save_current_markings()
         self.review_mode = not self.review_mode
         if self.review_mode:
+            self.labeled_files = self.load_labeled_files()  # Reload labeled files
             self.labeled_files_list = list(self.labeled_files)
             if not self.labeled_files_list:
                 messagebox.showinfo("Review Mode", "No labeled files to review.")
@@ -439,43 +498,81 @@ class SpectrogramViewer:
                 self.load_review_file()
         else:
             self.mode_label.config(text="Normal Mode")
-            self.load_next_file()
+            self.load_spectrogram()
+        self.update_file_info()
         self.canvas.focus_set()
-        print(f"Review mode: {'ON' if self.review_mode else 'OFF'}")
+        logging.debug(f"Review mode: {'ON' if self.review_mode else 'OFF'}")
 
     def load_review_file(self):
         if self.labeled_files_list:
             if 0 <= self.review_index < len(self.labeled_files_list):
                 file_to_review = self.labeled_files_list[self.review_index]
-                self.current_file_index = self.file_list.index(file_to_review)
+                # Find the index in self.file_list without path discrepancies
+                for idx, fname in enumerate(self.file_list):
+                    if os.path.basename(fname) == file_to_review:
+                        self.current_file_index = idx
+                        break
+                else:
+                    logging.error(f"File {file_to_review} not found in file list.")
+                    messagebox.showerror("Error", f"File {file_to_review} not found in file list.")
+                    return
                 self.load_spectrogram()
                 self.update_review_hud()
-                print(f"Reviewing file {self.review_index + 1} of {len(self.labeled_files_list)}: {file_to_review}")
             else:
                 messagebox.showinfo("Review Complete", "You've reviewed all labeled files.")
-                self.review_index = 0
-                self.load_review_file()
+                self.review_mode = False
+                self.mode_label.config(text="Normal Mode")
+                self.load_spectrogram()
         else:
-            print("No labeled files to review.")
+            logging.debug("No labeled files to review.")
+            messagebox.showinfo("Review Mode", "No labeled files to review.")
 
     def update_review_hud(self):
         current_file = self.file_list[self.current_file_index]
         self.filename_label.config(text=f"Reviewing: {current_file}")
         self.file_number_label.config(text=f"File {self.review_index + 1} of {len(self.labeled_files_list)}")
 
+    def auto_save_worker(self):
+        while not self.auto_save_event.is_set():
+            time.sleep(self.auto_save_interval)
+            if not self.auto_save_event.is_set():
+                self.save_current_markings()
+                logging.debug("Auto-saved current markings.")
+
 def run_app():
     root = tk.Tk()
     root.title("Spectrogram Viewer")
     root.geometry("800x600")
-
+    
+    # Remove the default close button
+    # root.overrideredirect(True)  # Commented out to prevent window from being blank
+    
     source_folder = filedialog.askdirectory(title="Select Source Folder")
     output_folder = filedialog.askdirectory(title="Select Output Folder")
 
-    app = SpectrogramViewer(root, source_folder, output_folder)
+    if not source_folder or not output_folder:
+        messagebox.showerror("Error", "Source and Output folders must be selected.")
+        root.destroy()
+        return
 
-    # Save state and perform clean-up when the application is closed
-    root.protocol("WM_DELETE_WINDOW", app.exit_app)
+    try:
+        app = SpectrogramViewer(root, source_folder, output_folder)
+    except Exception as e:
+        logging.error(f"Exception during initialization: {e}")
+        traceback.print_exc()
+        messagebox.showerror("Error", f"An error occurred during initialization: {e}")
+        root.destroy()
+        return
+
+    # Center the window on the screen
+    root.update_idletasks()
+    width = root.winfo_width()
+    height = root.winfo_height()
+    x = (root.winfo_screenwidth() // 2) - (width // 2)
+    y = (root.winfo_screenheight() // 2) - (height // 2)
+    root.geometry('{}x{}+{}+{}'.format(width, height, x, y))
 
     root.mainloop()
 
-run_app()
+if __name__ == "__main__":
+    run_app()
