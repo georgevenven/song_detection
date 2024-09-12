@@ -12,6 +12,8 @@ import logging
 import fcntl  # For file locking
 import io  # For BytesIO
 import traceback  # Add this import at the top of your file
+import shutil  # For file operations
+import random  # For shuffling unlabeled files
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -42,8 +44,20 @@ class SpectrogramViewer:
 
         self.json_path = os.path.join(source_folder, 'labeled_files.json')
         self.labeled_files = self.load_labeled_files()
-        self.labeled_files_order = list(self.labeled_files)
-        self.current_file_index = 0  # Start with the first file
+        
+        # Initialize unlabeled files and shuffle them
+        self.unlabeled_files = list(set(self.file_list) - self.labeled_files)
+        random.shuffle(self.unlabeled_files)
+        self.normal_mode_history = []
+        self.current_filename = None
+
+        if self.unlabeled_files:
+            self.current_filename = self.unlabeled_files.pop()
+            self.normal_mode_history.append(self.current_filename)
+        else:
+            messagebox.showinfo("Info", "All files have been labeled.")
+            self.root.destroy()
+            return
 
         # UI setup
         self.setup_ui()
@@ -72,7 +86,6 @@ class SpectrogramViewer:
         self.mode_label.pack(side="top", fill="x")
 
         self.current_npz_data = None
-        self.current_filename = None
 
         self.load_spectrogram()
         self.update_file_info()  # Add this line
@@ -210,23 +223,15 @@ class SpectrogramViewer:
         self.update_spectrogram_display(marked_image)
 
     def load_spectrogram(self):
-        if self.current_file_index < 0 or self.current_file_index >= len(self.file_list):
-            logging.error(f"Invalid current_file_index: {self.current_file_index}")
+        if self.current_filename is None:
+            logging.error("No current filename to load.")
             return
-
-        filename = self.file_list[self.current_file_index]
-        self.current_filename = filename
-        
+        filename = self.current_filename
         file_path = os.path.join(self.source_folder, filename)
         try:
-            # Read the file into memory with file locking
-            with open(file_path, 'rb') as f:
-                fcntl.flock(f, fcntl.LOCK_SH)
-                data = f.read()
-                fcntl.flock(f, fcntl.LOCK_UN)
-
-            # Load the data from the in-memory bytes
-            self.current_npz_data = np.load(io.BytesIO(data), allow_pickle=True)
+            # Read the data into a dictionary
+            with np.load(file_path, allow_pickle=True) as data:
+                self.current_npz_data = dict(data)
 
             spectrogram = self.downsample_spectrogram(self.current_npz_data['s'])
             
@@ -293,13 +298,11 @@ class SpectrogramViewer:
         self.canvas.image = tk_image
 
     def clear_annotations(self, event):
-        confirm = messagebox.askyesno("Confirm", "Are you sure you want to clear all annotations?")
-        if confirm:
-            self.selection_mask = Image.new('L', self.original_image.size, 0)
-            self.song_labels = np.zeros(self.original_image.width, dtype=np.uint8)
-            self.apply_selection_mask()
-            self.save_current_markings()
-            logging.debug("Annotations cleared")
+        self.selection_mask = Image.new('L', self.original_image.size, 0)
+        self.song_labels = np.zeros(self.original_image.width, dtype=np.uint8)
+        self.apply_selection_mask()
+        self.save_current_markings()
+        logging.debug("Annotations cleared")
         self.canvas.focus_set()
 
     def save_current_markings(self):
@@ -317,34 +320,28 @@ class SpectrogramViewer:
             full_song_labels[start:end] = label
 
         try:
-            # Create a backup before overwriting
+            # Save the updated data without deleting the original file
             filename = self.current_filename
             file_path = os.path.join(self.source_folder, filename)
             backup_path = file_path + '.bak'
-            if os.path.exists(file_path):
-                if not os.path.exists(backup_path):
-                    os.rename(file_path, backup_path)
-                else:
-                    os.remove(file_path)
+            if not os.path.exists(backup_path):
+                # Create a backup if it doesn't exist
+                shutil.copy2(file_path, backup_path)
             else:
-                logging.warning(f"Original file {file_path} does not exist for backup.")
+                # Overwrite the backup
+                shutil.copy2(file_path, backup_path)
 
-            # Acquire an exclusive lock for writing
+            # Update the 'song' data in current_npz_data
+            self.current_npz_data['song'] = full_song_labels
+
+            # Save the updated data
             with open(file_path, 'wb') as f:
                 fcntl.flock(f, fcntl.LOCK_EX)
-                updated_data = {}
-                for key in self.current_npz_data.files:
-                    if key != 'song':
-                        try:
-                            updated_data[key] = self.current_npz_data[key]
-                        except Exception as e:
-                            logging.error(f"Skipping corrupted array: {key}")
-                    else:
-                        updated_data['song'] = full_song_labels
-                np.savez(f, **updated_data)
+                np.savez(f, **self.current_npz_data)
                 fcntl.flock(f, fcntl.LOCK_UN)
             logging.debug(f"Saved markings for file: {filename}")
             self.mark_file_as_labeled()
+
         except Exception as e:
             logging.error(f"Error saving markings for file {filename}: {str(e)}")
             messagebox.showerror("Save Error", f"Failed to save labels for {filename}: {str(e)}")
@@ -355,8 +352,13 @@ class SpectrogramViewer:
             self.prev_review_file()
         else:
             self.save_current_markings()
-            self.current_file_index = max(0, self.current_file_index - 1)
-            self.load_spectrogram()
+            if len(self.normal_mode_history) > 1:
+                # Remove current file from history
+                self.normal_mode_history.pop()
+                self.current_filename = self.normal_mode_history[-1]
+                self.load_spectrogram()
+            else:
+                messagebox.showinfo("Info", "This is the first file, cannot go back.")
         self.update_file_info()
         self.canvas.focus_set()
 
@@ -365,8 +367,12 @@ class SpectrogramViewer:
             self.next_review_file()
         else:
             self.save_current_markings()
-            self.current_file_index = min(len(self.file_list) - 1, self.current_file_index + 1)
-            self.load_spectrogram()
+            if self.unlabeled_files:
+                self.current_filename = self.unlabeled_files.pop()
+                self.normal_mode_history.append(self.current_filename)
+                self.load_spectrogram()
+            else:
+                messagebox.showinfo("Info", "All files have been labeled.")
         self.update_file_info()
         self.canvas.focus_set()
 
@@ -384,43 +390,33 @@ class SpectrogramViewer:
         if self.review_mode:
             self.update_review_hud()
         else:
-            filename = self.file_list[self.current_file_index]
-            self.filename_label.config(text=filename)
-            self.file_number_label.config(text=f"File {self.current_file_index + 1} of {len(self.file_list)}")
+            self.filename_label.config(text=self.current_filename)
+            self.file_number_label.config(text=f"Unlabeled Files Remaining: {len(self.unlabeled_files)}")
 
     def jump_forward(self, event):
-        self.save_current_markings()
-        self.mark_file_as_labeled()
-        self.current_file_index = min(len(self.file_list) - 1, self.current_file_index + 50)
-        self.load_spectrogram()
+        # Disabled in normal mode due to random file navigation
+        if self.review_mode:
+            # Jump forward by 10 files in review mode
+            self.review_index = min(len(self.labeled_files_list) - 1, self.review_index + 10)
+            self.load_review_file()
+        else:
+            messagebox.showinfo("Info", "Jump Forward is disabled in random navigation mode.")
         self.canvas.focus_set()
 
     def jump_backward(self, event):
-        self.save_current_markings()
-        self.mark_file_as_labeled()
-        self.current_file_index = max(0, self.current_file_index - 50)
-        self.load_spectrogram()
+        # Disabled in normal mode due to random file navigation
+        if self.review_mode:
+            # Jump backward by 10 files in review mode
+            self.review_index = max(0, self.review_index - 10)
+            self.load_review_file()
+        else:
+            messagebox.showinfo("Info", "Jump Backward is disabled in random navigation mode.")
         self.canvas.focus_set()
 
     def next_unseen_file(self, event=None):
-        json_path = os.path.join(self.source_folder, 'summary.json')
-        if not os.path.exists(json_path):
-            return  # No summary file, can't determine unseen files
-
-        with open(json_path, 'r') as file:
-            try:
-                summary_data = json.load(file)
-            except json.JSONDecodeError:
-                logging.error("Corrupted summary.json file.")
-                messagebox.showerror("Error", "Corrupted summary.json file.")
-                return
-
-        processed_files = set(summary_data.get('processed_files', []))
-        for index, filename in enumerate(self.file_list):
-            if filename not in processed_files:
-                self.current_file_index = index
-                self.load_spectrogram()
-                break
+        # Disabled since normal mode already skips labeled files
+        messagebox.showinfo("Info", "Next Unseen File is not applicable in random navigation mode.")
+        self.canvas.focus_set()
 
     def get_keyboard_bindings_text(self):
         bindings_text = (
@@ -429,8 +425,7 @@ class SpectrogramViewer:
             "Scroll: Mouse Wheel\n"
             "Mark Selection: Enter\n"
             "Clear Annotations: W\n"
-            "Jump Forward/Backward: Up/Down Arrows\n"
-            "Next Unseen File: N\n"
+            "Jump Forward/Backward: Up/Down Arrows (Review Mode)\n"
             "Toggle Label Color: \\\n"
             "Toggle Review Mode: R\n"
         )
@@ -477,10 +472,13 @@ class SpectrogramViewer:
             messagebox.showerror("Error", f"Failed to save labeled files: {str(e)}")
 
     def mark_file_as_labeled(self):
-        current_file = os.path.basename(self.file_list[self.current_file_index])
+        current_file = os.path.basename(self.current_filename)
         self.labeled_files.add(current_file)
         logging.debug(f"Marking {current_file} as labeled")
         self.save_labeled_files()
+        # Remove from unlabeled files if present
+        if current_file in self.unlabeled_files:
+            self.unlabeled_files.remove(current_file)
 
     def toggle_review_mode(self, event):
         self.save_current_markings()
@@ -508,16 +506,14 @@ class SpectrogramViewer:
             if 0 <= self.review_index < len(self.labeled_files_list):
                 file_to_review = self.labeled_files_list[self.review_index]
                 # Find the index in self.file_list without path discrepancies
-                for idx, fname in enumerate(self.file_list):
-                    if os.path.basename(fname) == file_to_review:
-                        self.current_file_index = idx
-                        break
+                if file_to_review in self.file_list:
+                    self.current_filename = file_to_review
+                    self.load_spectrogram()
+                    self.update_review_hud()
                 else:
                     logging.error(f"File {file_to_review} not found in file list.")
                     messagebox.showerror("Error", f"File {file_to_review} not found in file list.")
                     return
-                self.load_spectrogram()
-                self.update_review_hud()
             else:
                 messagebox.showinfo("Review Complete", "You've reviewed all labeled files.")
                 self.review_mode = False
@@ -528,7 +524,7 @@ class SpectrogramViewer:
             messagebox.showinfo("Review Mode", "No labeled files to review.")
 
     def update_review_hud(self):
-        current_file = self.file_list[self.current_file_index]
+        current_file = self.current_filename
         self.filename_label.config(text=f"Reviewing: {current_file}")
         self.file_number_label.config(text=f"File {self.review_index + 1} of {len(self.labeled_files_list)}")
 
