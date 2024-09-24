@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, simpledialog
 from PIL import Image, ImageTk, ImageDraw
 import numpy as np
 import os
@@ -36,7 +36,7 @@ class SpectrogramViewer:
         self.source_folder = source_folder
         self.output_folder = output_folder
         self.file_list = sorted([f for f in os.listdir(self.source_folder) if f.endswith('.npz')])
-        
+
         if not self.file_list:
             messagebox.showerror("Error", "No .npz files found in the selected source folder.")
             self.root.destroy()
@@ -44,20 +44,12 @@ class SpectrogramViewer:
 
         self.json_path = os.path.join(source_folder, 'labeled_files.json')
         self.labeled_files = self.load_labeled_files()
-        
-        # Initialize unlabeled files and shuffle them
+
+        # Initialize unlabeled files without considering prefixes yet
         self.unlabeled_files = list(set(self.file_list) - self.labeled_files)
         random.shuffle(self.unlabeled_files)
         self.normal_mode_history = []
         self.current_filename = None
-
-        if self.unlabeled_files:
-            self.current_filename = self.unlabeled_files.pop()
-            self.normal_mode_history.append(self.current_filename)
-        else:
-            messagebox.showinfo("Info", "All files have been labeled.")
-            self.root.destroy()
-            return
 
         # UI setup
         self.setup_ui()
@@ -87,9 +79,19 @@ class SpectrogramViewer:
 
         self.current_npz_data = None
 
-        self.load_spectrogram()
-        self.update_file_info()  # Add this line
-        self.update_label_info()  # Initialize label info display
+        # Prompt prefix selection before loading any spectrogram
+        self.prompt_prefix_selection()
+
+        if self.unlabeled_files:
+            self.current_filename = self.unlabeled_files.pop()
+            self.normal_mode_history.append(self.current_filename)
+            self.load_spectrogram()
+            self.update_file_info()
+            self.update_label_info()  # Initialize label info display
+        else:
+            messagebox.showinfo("Info", "No files available for labeling with the selected prefixes.")
+            self.root.destroy()
+            return
 
         # Start auto-save thread
         self.auto_save_interval = 60  # Auto-save every 60 seconds
@@ -141,8 +143,135 @@ class SpectrogramViewer:
         self.canvas.bind("r", self.toggle_review_mode)
 
         # Add an exit button
-        exit_button = tk.Button(self.root, text="X", command=self.exit_app, bg="red", fg="white")
-        exit_button.pack(side="top", anchor="ne")
+        exit_button = tk.Button(self.root, text="X", command=self.exit_app, bg="red", fg="white", font=("Courier", 12, "bold"))
+        exit_button.place(x=10, y=10)  # Position it at the top-left corner
+
+        # Add prefix selection UI button (disabled after initial selection)
+        self.prefix_selection_button = tk.Button(self.root, text="Select Prefixes", command=self.select_prefixes, state="disabled")
+        self.prefix_selection_button.pack(side="top", anchor="nw", pady=5)
+
+    def prompt_prefix_selection(self):
+        """
+        Prompt the user to select prefixes before proceeding.
+        This function is called during initialization.
+        """
+        prefixes = sorted({f.split('_')[0] for f in self.file_list})
+        if not prefixes:
+            messagebox.showerror("Error", "No prefixes found in the filenames.")
+            self.root.destroy()
+            return
+
+        self.selected_prefixes = set()
+
+        def toggle_prefix(prefix):
+            if prefix in self.selected_prefixes:
+                self.selected_prefixes.remove(prefix)
+            else:
+                self.selected_prefixes.add(prefix)
+
+        def select_all():
+            self.selected_prefixes = set(prefixes)
+            for var in prefix_vars.values():
+                var.set(1)
+
+        def apply_selection():
+            if not self.selected_prefixes:
+                messagebox.showwarning("No Selection", "No prefixes selected. Please select at least one prefix.")
+                return
+            self.unlabeled_files = [f for f in self.file_list if f.split('_')[0] in self.selected_prefixes and f not in self.labeled_files]
+            random.shuffle(self.unlabeled_files)
+            selection_window.destroy()
+            if not self.unlabeled_files:
+                messagebox.showinfo("Info", "No files to label with the selected prefixes.")
+                self.root.destroy()
+
+        selection_window = tk.Toplevel(self.root)
+        selection_window.title("Select Prefixes")
+        selection_window.grab_set()  # Make the window modal
+
+        tk.Label(selection_window, text="Select Prefixes to Include for Labeling:", font=("Courier", 14, "bold")).pack(pady=10)
+
+        prefix_vars = {}
+        for prefix in prefixes:
+            var = tk.IntVar()
+            prefix_vars[prefix] = var
+            cb = tk.Checkbutton(selection_window, text=prefix, variable=var, command=lambda p=prefix: toggle_prefix(p), font=("Courier", 12))
+            cb.pack(anchor='w', padx=20)
+        
+        # By default, do not select any prefixes (empty checklist)
+        # User must select prefixes manually or use "Select All"
+
+        select_all_button = tk.Button(selection_window, text="Select All", command=select_all, font=("Courier", 12, "bold"), bg="lightblue")
+        select_all_button.pack(pady=10)
+
+        apply_button = tk.Button(selection_window, text="Apply", command=apply_selection, font=("Courier", 12, "bold"), bg="lightgreen")
+        apply_button.pack(pady=5)
+
+        self.root.wait_window(selection_window)  # Wait until the selection window is closed
+
+    def select_prefixes(self):
+        """
+        Allow the user to re-select prefixes during runtime.
+        This function can be called via the "Select Prefixes" button.
+        """
+        prefixes = sorted({f.split('_')[0] for f in self.file_list})
+        if not prefixes:
+            messagebox.showerror("Error", "No prefixes found in the filenames.")
+            return
+
+        self.selected_prefixes = set()
+
+        def toggle_prefix(prefix):
+            if prefix in self.selected_prefixes:
+                self.selected_prefixes.remove(prefix)
+            else:
+                self.selected_prefixes.add(prefix)
+
+        def select_all():
+            self.selected_prefixes = set(prefixes)
+            for var in prefix_vars.values():
+                var.set(1)
+
+        def apply_selection():
+            if not self.selected_prefixes:
+                messagebox.showwarning("No Selection", "No prefixes selected. Please select at least one prefix.")
+                return
+            # Update unlabeled_files based on new selection
+            new_unlabeled = [f for f in self.file_list if f.split('_')[0] in self.selected_prefixes and f not in self.labeled_files]
+            random.shuffle(new_unlabeled)
+            self.unlabeled_files = new_unlabeled
+            if self.unlabeled_files:
+                self.current_filename = self.unlabeled_files.pop()
+                self.normal_mode_history.append(self.current_filename)
+                self.load_spectrogram()
+            else:
+                messagebox.showinfo("Info", "No files to label with the selected prefixes.")
+                self.root.destroy()
+            selection_window.destroy()
+
+        selection_window = tk.Toplevel(self.root)
+        selection_window.title("Select Prefixes")
+        selection_window.grab_set()  # Make the window modal
+
+        tk.Label(selection_window, text="Select Prefixes to Include for Labeling:", font=("Courier", 14, "bold")).pack(pady=10)
+
+        prefix_vars = {}
+        for prefix in prefixes:
+            var = tk.IntVar()
+            prefix_vars[prefix] = var
+            cb = tk.Checkbutton(selection_window, text=prefix, variable=var, command=lambda p=prefix: toggle_prefix(p), font=("Courier", 12))
+            cb.pack(anchor='w', padx=20)
+        
+        # Retain the previously selected prefixes
+        for f in self.selected_prefixes:
+            if f in prefix_vars:
+                prefix_vars[f].set(1)
+
+        select_all_button = tk.Button(selection_window, text="Select All", command=select_all, font=("Courier", 12, "bold"), bg="lightblue")
+        select_all_button.pack(pady=10)
+
+        apply_button = tk.Button(selection_window, text="Apply", command=apply_selection, font=("Courier", 12, "bold"), bg="lightgreen")
+        apply_button.pack(pady=5)
 
     def on_press(self, event):
         self.selection_start = self.canvas.canvasx(event.x)
@@ -266,8 +395,8 @@ class SpectrogramViewer:
 
             # Set zoom to show entire spectrogram
             self.canvas_width = self.canvas.winfo_width()
-            self.zoom_factor = self.canvas_width / self.original_image.width
-            
+            self.zoom_factor = self.canvas_width / self.original_image.width if self.original_image.width > 0 else 1
+
             self.apply_selection_mask()
 
             # Update total length label
@@ -295,7 +424,7 @@ class SpectrogramViewer:
         self.canvas.config(scrollregion=(0, 0, image.width, image.height))
         tk_image = ImageTk.PhotoImage(image)
         self.canvas.create_image(0, 0, anchor="nw", image=tk_image)
-        self.canvas.image = tk_image
+        self.canvas.image = tk_image  # Keep a reference to prevent garbage collection
 
     def clear_annotations(self, event):
         self.selection_mask = Image.new('L', self.original_image.size, 0)
@@ -428,6 +557,7 @@ class SpectrogramViewer:
             "Jump Forward/Backward: Up/Down Arrows (Review Mode)\n"
             "Toggle Label Color: \\\n"
             "Toggle Review Mode: R\n"
+            "Select Prefixes: Click 'Select Prefixes' Button\n"
         )
         return bindings_text
 
@@ -447,6 +577,7 @@ class SpectrogramViewer:
     def exit_app(self):
         if messagebox.askokcancel("Quit", "Do you want to quit?"):
             self.save_current_markings()  # Save any unsaved changes
+            self.auto_save_event.set()  # Stop the auto-save thread
             self.root.quit()
             self.root.destroy()
 
@@ -485,7 +616,7 @@ class SpectrogramViewer:
         self.review_mode = not self.review_mode
         if self.review_mode:
             self.labeled_files = self.load_labeled_files()  # Reload labeled files
-            self.labeled_files_list = list(self.labeled_files)
+            self.labeled_files_list = sorted(list(self.labeled_files))
             if not self.labeled_files_list:
                 messagebox.showinfo("Review Mode", "No labeled files to review.")
                 self.review_mode = False
@@ -538,16 +669,20 @@ class SpectrogramViewer:
 def run_app():
     root = tk.Tk()
     root.title("Spectrogram Viewer")
-    root.geometry("800x600")
+    root.geometry("1200x800")  # Increased size for better visibility
     
-    # Remove the default close button
-    # root.overrideredirect(True)  # Commented out to prevent window from being blank
+    # Optionally, remove the default close button
+    # root.overrideredirect(True)  # Uncomment if you want to remove the window decorations
     
     source_folder = filedialog.askdirectory(title="Select Source Folder")
-    output_folder = filedialog.askdirectory(title="Select Output Folder")
+    if not source_folder:
+        messagebox.showerror("Error", "Source folder must be selected.")
+        root.destroy()
+        return
 
-    if not source_folder or not output_folder:
-        messagebox.showerror("Error", "Source and Output folders must be selected.")
+    output_folder = filedialog.askdirectory(title="Select Output Folder")
+    if not output_folder:
+        messagebox.showerror("Error", "Output folder must be selected.")
         root.destroy()
         return
 
