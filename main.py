@@ -191,18 +191,16 @@ class SpectrogramViewer:
 
         tk.Label(selection_window, text="Select Prefixes to Include for Labeling:", font=("Courier", 14, "bold")).pack(pady=10)
 
+        # Add the "Select All" button before the checkboxes
+        select_all_button = tk.Button(selection_window, text="Select All", command=select_all, font=("Courier", 12, "bold"), bg="lightblue")
+        select_all_button.pack(pady=10)
+
         prefix_vars = {}
         for prefix in prefixes:
             var = tk.IntVar()
             prefix_vars[prefix] = var
             cb = tk.Checkbutton(selection_window, text=prefix, variable=var, command=lambda p=prefix: toggle_prefix(p), font=("Courier", 12))
             cb.pack(anchor='w', padx=20)
-        
-        # By default, do not select any prefixes (empty checklist)
-        # User must select prefixes manually or use "Select All"
-
-        select_all_button = tk.Button(selection_window, text="Select All", command=select_all, font=("Courier", 12, "bold"), bg="lightblue")
-        select_all_button.pack(pady=10)
 
         apply_button = tk.Button(selection_window, text="Apply", command=apply_selection, font=("Courier", 12, "bold"), bg="lightgreen")
         apply_button.pack(pady=5)
@@ -255,6 +253,10 @@ class SpectrogramViewer:
 
         tk.Label(selection_window, text="Select Prefixes to Include for Labeling:", font=("Courier", 14, "bold")).pack(pady=10)
 
+        # Add the "Select All" button before the checkboxes
+        select_all_button = tk.Button(selection_window, text="Select All", command=select_all, font=("Courier", 12, "bold"), bg="lightblue")
+        select_all_button.pack(pady=10)
+
         prefix_vars = {}
         for prefix in prefixes:
             var = tk.IntVar()
@@ -266,9 +268,6 @@ class SpectrogramViewer:
         for f in self.selected_prefixes:
             if f in prefix_vars:
                 prefix_vars[f].set(1)
-
-        select_all_button = tk.Button(selection_window, text="Select All", command=select_all, font=("Courier", 12, "bold"), bg="lightblue")
-        select_all_button.pack(pady=10)
 
         apply_button = tk.Button(selection_window, text="Apply", command=apply_selection, font=("Courier", 12, "bold"), bg="lightgreen")
         apply_button.pack(pady=5)
